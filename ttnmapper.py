@@ -17,7 +17,9 @@ import time
 from binascii import hexlify, unhexlify
 from machine import Pin, UART, Timer
 from network import LoRa
-from nmea import NmeaParser
+
+from L76GNSS import L76GNSS
+from pytrack import Pytrack
 
 
 ################################################################################
@@ -25,21 +27,18 @@ from nmea import NmeaParser
 ################################################################################
 
 # LoRaWAN Configuration
-LORA_APP_EUI    = '70B3D57EF0001ED4'
-LORA_APP_KEY    = None      # See README.md for instructions!
-LORA_ENABLE_PIN = 'P9'
+dev_eui = unhexlify('00B23A6A5892A055'.replace(' ',''))
+app_eui = unhexlify('70B3D57EF0006815'.replace(' ',''))
+app_key = unhexlify('BC6F6A2E7C2CA2B6B5DE7B3506E4AAF1'.replace(' ',''))
 
 # Interval between measures transmitted to TTN.
 # Measured airtime of transmission is 56.6 ms, fair use policy limits us to
 # 30 seconds per day (= roughly 500 messages). We default to a 180 second
 # interval (=480 messages / day).
-SEND_RATE       = 180
+SEND_RATE       = 60 #180
 
 # GNSS Configuration
-GNSS_TIMEOUT    = 5000      # Timeout for obtaining position (miliseconds)
-GNSS_ENABLE_PIN = 'P8'
-GNSS_UART_PORT  = 1
-GNSS_UART_BAUD  = 9600
+GNSS_TIMEOUT    = 12000      # Timeout for obtaining position (miliseconds)
 
 # Colors used for status LED
 RGB_OFF         = 0x000000
@@ -50,6 +49,7 @@ RGB_LORA_JOIN   = 0x000040
 RGB_LORA_JOINED = 0x004000
 LED_TIMEOUT     = 0.2
 
+sock = 0
 
 ################################################################################
 # Function Definitions
@@ -59,41 +59,21 @@ def log(msg):
     """Helper method for logging messages"""
     print('ttnmapper: {}'.format(msg))
 
-def init_gnss():
-    """Initialize the GNSS receiver"""
-
-    log('Initializing GNSS...')
-
-    enable = Pin(GNSS_ENABLE_PIN, mode=Pin.OUT)
-    enable(False)
-    uart = UART(GNSS_UART_PORT)
-    uart.init(GNSS_UART_BAUD, bits=8, parity=None, stop=1)
-    enable(True)
-
-    log('Done!')
-
-    return (uart, enable)
-
 def init_lora():
     """Initialize LoRaWAN connection"""
-
-    if not Pin(LORA_ENABLE_PIN, mode=Pin.IN, pull=Pin.PULL_UP)():
-        log('LoRa disabled!')
-        return (None, None)
 
     lora = LoRa(mode=LoRa.LORAWAN)
     log('Initializing LoRaWAN, DEV EUI: {} ...'.format(hexlify(lora.mac())
         .decode('ascii').upper()))
 
-    if not LORA_APP_KEY:
+    if not app_key:
         log('ERROR: LoRaWAN APP KEY not set!')
         log('Send your DEV EUI to thethingsnetwork@bfh.ch to obtain one.')
         return (None, None)
 
     pycom.rgbled(RGB_LORA_JOIN)
 
-    lora.join(activation=LoRa.OTAA, auth=(unhexlify(LORA_APP_EUI),
-        unhexlify(LORA_APP_KEY)), timeout=0)
+    lora.join(activation=LoRa.OTAA, auth=(dev_eui, app_eui, app_key), timeout=0)
 
     while not lora.has_joined():
         log('Joining...')
@@ -116,38 +96,44 @@ def gnss_position():
     """Obtain current GNSS position.
     If a position has been obtained, returns an instance of NmeaParser
     containing the data. Otherwise, returns None."""
-
-    nmea = NmeaParser()
     start = time.ticks_ms()
-
+    count = 0
+    while count < 20:
+        coord = l76.coordinates()
+        count += 1
     while time.ticks_diff(start, time.ticks_ms()) < GNSS_TIMEOUT:
-        if nmea.update(gnss_uart.readall()):
-            log('Current position: {}'.format(nmea))
-            return nmea
+        coord = l76.coordinates()
+        if coord[0] != 0 and coord[2] != 0:
+            log('Current position: {}'.format(coord))
+            return coord
 
-    log('No position: {}'.format(nmea.error))
+    log('No position')
     return None
 
-def transmit(nmea):
+def transmit(pos):
     """Encode current position, altitude and hdop and send it using LoRaWAN"""
 
     data = array.array('B', [0, 0, 0, 0, 0, 0, 0, 0, 0])
 
-    lat = int(((nmea.latitude + 90) / 180) * 16777215)
+    lat = int(((pos[0] + 90) / 180) * 16777215)
+    print(lat)
     data[0] = (lat >> 16) & 0xff
     data[1] = (lat >> 8) & 0xff
     data[2] = lat & 0xff
 
-    lon = int(((nmea.longitude + 180) / 360) * 16777215)
+    lon = int(((pos[1] + 180) / 360) * 16777215)
+    print(lon)
     data[3] = (lon >> 16) & 0xff
     data[4] = (lon >> 8) & 0xff
     data[5] = lon &0xff
 
-    alt = int(nmea.altitude)
+    alt = int(pos[3])
+    print(alt)
     data[6] = (alt >> 8) & 0xff
     data[7] = alt & 0xff
 
-    hdop = int(nmea.hdop * 10)
+    hdop = int(pos[2] * 10)
+    print(hdop)
     data[8] = hdop & 0xff
 
     message = bytes(data)
@@ -183,7 +169,9 @@ log('Starting up...')
 
 pycom.heartbeat(False)      # Turn off hearbeat LED
 
-(gnss_uart, gnss_enable) = init_gnss()
+py = Pytrack()
+l76 = L76GNSS(py, timeout=30)
+
 (lora, sock) = init_lora()
 
 if lora:
